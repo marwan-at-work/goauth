@@ -43,6 +43,8 @@ type Authenticator struct {
 	// supplies to verify that a user is allowed to access
 	// the http endpoint.
 	VerifyFunc func(ctx context.Context, claims IdentityClaimSet) error
+	// OnError is a function that can be used to debug messages
+	OnError func(err error)
 }
 
 func (a *Authenticator) Middleware(next http.Handler) http.Handler {
@@ -97,31 +99,33 @@ func (a *Authenticator) callbackHandler(w http.ResponseWriter, r *http.Request) 
 	// verify state
 	uri, ok := a.verifyState(ctx, r.FormValue("state"))
 	if !ok {
+		a.OnError(fmt.Errorf("invalid state"))
 		forbidden(w)
 		return
 	}
 
 	code := r.FormValue("code")
 	if strings.TrimSpace(code) == "" {
+		a.OnError(fmt.Errorf("missing code query param"))
 		forbidden(w)
 		return
 	}
 
 	token, err := a.Config.Exchange(ctx, code)
 	if err != nil {
-		// a.Config.Logger.Log("error", err, "message", "unable to exchange code")
+		a.OnError(fmt.Errorf("unable to exchange code: %w", err))
 		forbidden(w)
 		return
 	}
 	idI := token.Extra("id_token")
 	if idI == nil {
+		a.OnError(fmt.Errorf("missing id_token"))
 		forbidden(w)
 		return
 	}
 	id, ok := idI.(string)
 	if !ok {
-		// a.Config.Logger.Log("message", "id_token was not a string",
-		// 	"error", "unexpectected type: "+fmt.Sprintf("%T", idI))
+		a.OnError(fmt.Errorf("expected id_token to be a string but got %T", idI))
 		forbidden(w)
 		return
 	}
@@ -130,6 +134,7 @@ func (a *Authenticator) callbackHandler(w http.ResponseWriter, r *http.Request) 
 	// via the given verifyFunc
 	claims, err := a.verify(r.Context(), id)
 	if err != nil {
+		a.OnError(fmt.Errorf("verify error: %w", err))
 		forbidden(w)
 		return
 	}
@@ -148,31 +153,29 @@ func (a *Authenticator) verify(ctx context.Context, token string) (IdentityClaim
 	var claims IdentityClaimSet
 	hdr, rawPayload, err := decodeToken(token)
 	if err != nil {
-		// return false, errors.Wrap(ErrBadCreds, err.Error())
-		return claims, err
+		return claims, fmt.Errorf("decode token error: %w", err)
 	}
 
 	// keys, err := a.ks.Get(ctx)
 	keys, err := NewPublicKeySetFromURL(http.DefaultClient, publicKeysURL, 2*time.Hour)
 	if err != nil {
-		return claims, err
+		return claims, fmt.Errorf("public key set error: %w", err)
 	}
 
 	key, err := keys.GetKey(hdr.KeyID)
 	if err != nil {
-		return claims, err
+		return claims, fmt.Errorf("error getting key: %w", err)
 	}
 
 	err = jws.Verify(token, key)
 	if err != nil {
-		// return claims, errors.Wrap(ErrBadCreds, err.Error())
-		return claims, err
+		return claims, fmt.Errorf("error verifying jws: %w", err)
 	}
 
 	// use claims decoder func
 	claims, err = decodeClaims(ctx, rawPayload)
 	if err != nil {
-		return claims, err
+		return claims, fmt.Errorf("error decoding claims: %w", err)
 	}
 
 	nowUnix := TimeNow().Unix()
