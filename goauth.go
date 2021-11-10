@@ -30,8 +30,8 @@ type Authenticator struct {
 	Config *oauth2.Config
 	// OauthPath is the required oauth callback path.
 	OauthPath string
-	// SkipPaths are paths that skip authentication
-	SkipPaths []string
+	// SkipFunc for paths that skip authentication
+	SkipFunc func(r *http.Request) bool
 	// CookieNmae is the cookie that gets sent to the client
 	CookieName string
 	// Whether to set "secure" on the cookie value or not
@@ -53,11 +53,9 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 			a.callbackHandler(w, r)
 			return
 		}
-		for _, sp := range a.SkipPaths {
-			if r.URL.Path == sp {
-				next.ServeHTTP(w, r)
-				return
-			}
+		if a.SkipFunc != nil && a.SkipFunc(r) {
+			next.ServeHTTP(w, r)
+			return
 		}
 		ck, err := r.Cookie(a.CookieName)
 		if err != nil || ck.Value == "" {
