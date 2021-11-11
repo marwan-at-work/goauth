@@ -13,8 +13,10 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/dgraph-io/ristretto"
 	"golang.org/x/oauth2"
 	"marwan.io/goauth/jws"
 )
@@ -45,9 +47,55 @@ type Authenticator struct {
 	VerifyFunc func(ctx context.Context, claims IdentityClaimSet) error
 	// OnError is a function that can be used to debug messages
 	OnError func(err error)
+
+	f publicKeySetFetcher
 }
 
-func (a *Authenticator) Middleware(next http.Handler) http.Handler {
+// NewAuthenticator returns a new http middleware based on the given parameters.
+// If required parameters are nil, this function will panic.
+func NewAuthenticator(a *Authenticator) func(http.Handler) http.Handler {
+	if a.VerifyFunc == nil {
+		panic("verify func must not be nil")
+	}
+	if a.Config == nil {
+		panic("oauth2 config must not be nil")
+	}
+	c, err := ristretto.NewCache(&ristretto.Config{
+		NumCounters: 100,
+		MaxCost:     100,
+		BufferItems: 100,
+	})
+	if err != nil {
+		panic(err)
+	}
+	a.f = &fromCache{
+		c: c,
+		f: &fromURL{
+			hc:         http.DefaultClient,
+			url:        publicKeysURL,
+			defaultTTL: 2 * time.Hour,
+		},
+	}
+	if a.OnError == nil {
+		a.OnError = func(err error) {}
+	}
+	return a.middleware
+}
+
+// IdentityClaimSet holds all the expected values for the various versions of the GCP
+// identity token.
+// More details:
+// https://cloud.google.com/compute/docs/instances/verifying-instance-identity#payload
+// https://developers.google.com/identity/sign-in/web/backend-auth#calling-the-tokeninfo-endpoint
+type IdentityClaimSet struct {
+	jws.ClaimSet
+
+	// Email address of the default service account (only exists on GAE 2nd gen?)
+	Email         string `json:"email"`
+	EmailVerified bool   `json:"email_verified"`
+}
+
+func (a *Authenticator) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == a.OauthPath {
 			a.callbackHandler(w, r)
@@ -154,13 +202,12 @@ func (a *Authenticator) verify(ctx context.Context, token string) (IdentityClaim
 		return claims, fmt.Errorf("decode token error: %w", err)
 	}
 
-	// keys, err := a.ks.Get(ctx)
-	keys, err := NewPublicKeySetFromURL(http.DefaultClient, publicKeysURL, 2*time.Hour)
+	keys, err := a.f.fetchPublicKeySet(ctx)
 	if err != nil {
 		return claims, fmt.Errorf("public key set error: %w", err)
 	}
 
-	key, err := keys.GetKey(hdr.KeyID)
+	key, err := keys.geKey(hdr.KeyID)
 	if err != nil {
 		return claims, fmt.Errorf("error getting key: %w", err)
 	}
@@ -206,38 +253,45 @@ func (a *Authenticator) verifyState(ctx context.Context, state string) (string, 
 	return state, true
 }
 
-// PublicKeySet contains a set of keys acquired from a JWKS that has an expiration.
-type PublicKeySet struct {
+// publicKeySet contains a set of keys acquired from a JWKS that has an expiration.
+type publicKeySet struct {
 	Expiry time.Time
+	mu     sync.RWMutex
 	Keys   map[string]*rsa.PublicKey
 }
 
 var reMaxAge = regexp.MustCompile("max-age=([0-9]*)")
 
-// NewPublicKeySetFromURL will attempt to fetch a JWKS from the given URL and parse it
-// into a PublicKeySet. The endpoint the URL points to must return the same format as the
-// JSONKeyResponse struct.
-func NewPublicKeySetFromURL(hc *http.Client, url string, defaultTTL time.Duration) (PublicKeySet, error) {
-	var ks PublicKeySet
-	r, err := http.NewRequest(http.MethodGet, url, nil)
+type publicKeySetFetcher interface {
+	fetchPublicKeySet(ctx context.Context) (*publicKeySet, error)
+}
+
+type fromURL struct {
+	hc         *http.Client
+	url        string
+	defaultTTL time.Duration
+}
+
+func (f *fromURL) fetchPublicKeySet(ctx context.Context) (*publicKeySet, error) {
+	r, err := http.NewRequest(http.MethodGet, f.url, nil)
 	if err != nil {
 		// return ks, errors.Wrap(err, "unable to create request")
-		return ks, err
+		return nil, err
 	}
 
-	resp, err := hc.Do(r)
+	resp, err := f.hc.Do(r)
 	if err != nil {
-		return ks, err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
-	ttl := defaultTTL
+	ttl := f.defaultTTL
 	if ccHeader := resp.Header.Get("cache-control"); ccHeader != "" {
 		if match := reMaxAge.FindStringSubmatch(ccHeader); len(match) > 1 {
 			maxAgeSeconds, err := strconv.ParseInt(match[1], 10, 64)
 			if err != nil {
 				// return ks, errors.Wrap(err, "unable to parse cache-control max age")
-				return ks, err
+				return nil, err
 			}
 			ttl = time.Second * time.Duration(maxAgeSeconds)
 		}
@@ -246,19 +300,38 @@ func NewPublicKeySetFromURL(hc *http.Client, url string, defaultTTL time.Duratio
 	payload, err := io.ReadAll(resp.Body)
 	if err != nil {
 		// return ks, errors.Wrap(err, "unable to read response")
-		return ks, err
+		return nil, err
 	}
 
-	return NewPublicKeySetFromJSON(payload, ttl)
+	return publicKeySetFromJSON(payload, ttl)
 }
 
-// JSONKeyResponse represents a JWK Set object.
-type JSONKeyResponse struct {
-	Keys []*JSONKey `json:"keys"`
+type fromCache struct {
+	c *ristretto.Cache
+	f publicKeySetFetcher
 }
 
-// JSONKey represents a public or private key in JWK format.
-type JSONKey struct {
+func (f *fromCache) fetchPublicKeySet(ctx context.Context) (*publicKeySet, error) {
+	const key = "public-key-set"
+	resp, ok := f.c.Get(key)
+	if !ok {
+		pks, err := f.f.fetchPublicKeySet(ctx)
+		if err != nil {
+			return nil, err
+		}
+		f.c.SetWithTTL(key, pks, 1, time.Until(pks.Expiry))
+		resp = pks
+	}
+	return resp.(*publicKeySet), nil
+}
+
+// jsonKeyResponse represents a JWK Set object.
+type jsonKeyResponse struct {
+	Keys []*jsonKey `json:"keys"`
+}
+
+// jsonKey represents a public or private key in JWK format.
+type jsonKey struct {
 	Kty string `json:"kty"`
 	Alg string `json:"alg"`
 	Use string `json:"use"`
@@ -271,19 +344,19 @@ type JSONKey struct {
 // this global function as a mechanism to help with testing.
 var TimeNow = func() time.Time { return time.Now() }
 
-// NewPublicKeySetFromJSON will accept a JSON payload in the format of the
+// publicKeySetFromJSON will accept a JSON payload in the format of the
 // JSONKeyResponse and parse it into a PublicKeySet.
-func NewPublicKeySetFromJSON(payload []byte, ttl time.Duration) (PublicKeySet, error) {
+func publicKeySetFromJSON(payload []byte, ttl time.Duration) (*publicKeySet, error) {
 	var (
-		ks   PublicKeySet
-		keys JSONKeyResponse
+		ks   publicKeySet
+		keys jsonKeyResponse
 	)
 	err := json.Unmarshal(payload, &keys)
 	if err != nil {
-		return ks, err
+		return nil, err
 	}
 
-	ks = PublicKeySet{
+	ks = publicKeySet{
 		Expiry: TimeNow().Add(ttl),
 		Keys:   map[string]*rsa.PublicKey{},
 	}
@@ -293,11 +366,11 @@ func NewPublicKeySetFromJSON(payload []byte, ttl time.Duration) (PublicKeySet, e
 		if key.Use == "sig" && key.Kty == "RSA" {
 			n, err := base64.RawURLEncoding.DecodeString(key.N)
 			if err != nil {
-				return ks, err
+				return nil, err
 			}
 			e, err := base64.RawURLEncoding.DecodeString(key.E)
 			if err != nil {
-				return ks, err
+				return nil, err
 			}
 			ei := big.NewInt(0).SetBytes(e).Int64()
 			ks.Keys[key.Kid] = &rsa.PublicKey{
@@ -306,7 +379,7 @@ func NewPublicKeySetFromJSON(payload []byte, ttl time.Duration) (PublicKeySet, e
 			}
 		}
 	}
-	return ks, nil
+	return &ks, nil
 }
 
 func forbidden(w http.ResponseWriter) {
@@ -338,27 +411,10 @@ func decodeToken(token string) (*jws.Header, []byte, error) {
 	return &h, dcs, nil
 }
 
-// IdentityClaimSet holds all the expected values for the various versions of the GCP
-// identity token.
-// More details:
-// https://cloud.google.com/compute/docs/instances/verifying-instance-identity#payload
-// https://developers.google.com/identity/sign-in/web/backend-auth#calling-the-tokeninfo-endpoint
-type IdentityClaimSet struct {
-	jws.ClaimSet
-
-	// Email address of the default service account (only exists on GAE 2nd gen?)
-	Email         string `json:"email"`
-	EmailVerified bool   `json:"email_verified"`
-}
-
-// Expired will return true if the current key set is expire according to its Expiry
-// field.
-func (ks PublicKeySet) Expired() bool {
-	return TimeNow().After(ks.Expiry)
-}
-
-// GetKey will look for the given key ID in the key set and return it, if it exists.
-func (ks PublicKeySet) GetKey(id string) (*rsa.PublicKey, error) {
+// geKey will look for the given key ID in the key set and return it, if it exists.
+func (ks *publicKeySet) geKey(id string) (*rsa.PublicKey, error) {
+	ks.mu.RLock()
+	defer ks.mu.RUnlock()
 	if len(ks.Keys) == 0 {
 		return nil, errors.New("no public keys found")
 	}
